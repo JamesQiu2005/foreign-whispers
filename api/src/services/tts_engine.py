@@ -21,12 +21,13 @@ CHATTERBOX_SPEAKER_WAV = os.getenv("CHATTERBOX_SPEAKER_WAV", "")
 # Default is "on" (new clamped path). Useful for A/B comparisons.
 _ALIGNMENT_ENABLED = os.getenv("FW_ALIGNMENT", "on").lower() != "off"
 
-SPEED_MIN = 0.75
+SPEED_MIN = 0.90  # don't slow audio below 90% of natural pace
 SPEED_MAX = 1.25
 # When TTS audio is less than this fraction of the target window, skip
 # time-stretching entirely — play at natural speed and pad with silence.
-# Prevents comically slow speech in windows with long narrator pauses.
-_STRETCH_SKIP_RATIO = 0.5
+# Prevents unnatural elongation when Spanish TTS naturally packs words tighter
+# than English source speech (very common — most segments hit this branch).
+_STRETCH_SKIP_RATIO = 0.85
 _SPEED_MIN_LEGACY = 0.1
 _SPEED_MAX_LEGACY = 10.0
 

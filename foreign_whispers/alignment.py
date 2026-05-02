@@ -33,35 +33,34 @@ def _count_syllables(text: str) -> int:
 
 
 # ── Empirically tuned duration model ──────────────────────────────────────
-# Calibrated against 70 ground-truth Chatterbox-MPS segments from the Strait
-# of Hormuz dub (`pipeline_data/.../*.align.json`).
-# Original heuristic (4.5 syll/s, no pause model): MAE 0.416s
-# Tuned (5.40 syll/s + punctuation pauses):        MAE 0.281s (-32%)
-# These constants can be re-fit per TTS engine; see notebooks/alignment_integration.
-_SYLLABLE_RATE = 5.40         # syllables per second for Romance-language TTS
-_COMMA_PAUSE_S = 0.15         # added per `,` `;` `:`
-_TERMINAL_PAUSE_S = 0.30      # added per `.` `!` `?`
-_UTTERANCE_OVERHEAD_S = 0.10  # constant onset/offset breath
-
-
-def _count_punctuation_pause(text: str) -> float:
-    """Sum of expected pause durations for punctuation in *text* (seconds)."""
-    soft = len(re.findall(r"[,;:]", text)) * _COMMA_PAUSE_S
-    hard = len(re.findall(r"[.!?]", text)) * _TERMINAL_PAUSE_S
-    return soft + hard
+# Linear regression fit against 170 ground-truth Chatterbox-MPS segments
+# from the Strait of Hormuz dub (Spanish, voice-cloned per speaker).
+# Old syllable-rate heuristic on these segments: MAE 0.747s (ME -0.730s, under-predict).
+# New char + punctuation regression:             MAE 0.309s (ME 0.000s).
+_DUR_CHARS_COEF  = 0.0734   # per character (~13.6 chars/s)
+_DUR_COMMA_COEF  = 0.0340   # extra per `,` `;` `:`
+_DUR_PERIOD_COEF = 0.0746   # extra per `.` `!` `?`
+_DUR_BIAS        = 0.593    # constant onset/offset overhead (s)
 
 
 def _estimate_duration(text: str) -> float:
     """Estimate TTS duration in seconds.
 
-    Combines a syllable-rate model with punctuation pause overhead and a
-    small fixed utterance onset/offset cost. Calibrated against
-    Chatterbox-MPS ground truth — see module-level constants.
+    Linear regression on character count + soft/hard punctuation counts,
+    fit on Chatterbox-MPS ground truth. Re-fit per TTS engine using the
+    notebook in alignment_integration.
     """
     if not text or not text.strip():
         return 0.0
-    syllable_seconds = _count_syllables(text) / _SYLLABLE_RATE
-    return _UTTERANCE_OVERHEAD_S + syllable_seconds + _count_punctuation_pause(text)
+    chars   = len(text)
+    commas  = len(re.findall(r"[,;:]", text))
+    periods = len(re.findall(r"[.!?]", text))
+    return (
+        _DUR_CHARS_COEF  * chars
+        + _DUR_COMMA_COEF  * commas
+        + _DUR_PERIOD_COEF * periods
+        + _DUR_BIAS
+    )
 
 
 @dataclasses.dataclass

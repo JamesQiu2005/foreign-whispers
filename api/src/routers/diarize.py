@@ -38,16 +38,18 @@ def _extract_audio(video_path, audio_path) -> None:
 
 
 def _merge_speakers_into_transcript(title: str, diar_segments: list[dict]) -> None:
-    """Add a ``speaker`` field to every segment in the cached transcription JSON."""
-    transcript_path = settings.transcriptions_dir / f"{title}.json"
-    if not transcript_path.exists():
-        return
-    transcript = json.loads(transcript_path.read_text())
-    transcript["segments"] = assign_speakers(
-        transcript.get("segments", []),
-        diar_segments,
-    )
-    transcript_path.write_text(json.dumps(transcript))
+    """Add a ``speaker`` field to every segment in the cached transcription JSON
+    *and* the cached translation JSON (the TTS voice_map reads from the latter).
+    """
+    for path in (
+        settings.transcriptions_dir / f"{title}.json",
+        settings.translations_dir / f"{title}.json",
+    ):
+        if not path.exists():
+            continue
+        doc = json.loads(path.read_text())
+        doc["segments"] = assign_speakers(doc.get("segments", []), diar_segments)
+        path.write_text(json.dumps(doc))
 
 
 @router.post("/diarize/{video_id}", response_model=DiarizeResponse)
