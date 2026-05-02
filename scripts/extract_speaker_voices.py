@@ -44,49 +44,109 @@ def resolve_title(video_id: str) -> tuple[str, str]:
     raise SystemExit(f"video_id {video_id!r} not found in {REGISTRY_PATH}")
 
 
-def pick_reference_interval(
+def pick_reference_intervals(
     intervals: list[dict],
     max_seconds: float,
     min_seconds: float,
-) -> tuple[float, float] | None:
-    """Choose ``(start_s, duration_s)`` for the cleanest reference clip.
+    top_n: int,
+) -> list[tuple[float, float]]:
+    """Choose up to *top_n* ``(start_s, duration_s)`` clips for one speaker.
 
-    Strategy: longest single contiguous turn, clipped to ``max_seconds``,
-    with a 0.2s lead-in trim to dodge crosstalk at boundaries. Returns
-    ``None`` when no turn meets ``min_seconds``.
+    Strategy: take the top-N longest contiguous turns, each clipped to
+    ``max_seconds`` and trimmed by 0.2s of lead-in to dodge crosstalk.
+    Skip turns shorter than ``min_seconds``. Returns ``[]`` when nothing
+    qualifies.
     """
-    if not intervals:
-        return None
-    longest = max(intervals, key=lambda i: i["end_s"] - i["start_s"])
-    duration = longest["end_s"] - longest["start_s"]
-    if duration < min_seconds:
-        return None
-    start = longest["start_s"] + 0.2
-    duration = min(duration - 0.2, max_seconds)
-    return start, duration
-
-
-def extract_wav(video_path: Path, start: float, duration: float, out_path: Path) -> None:
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-ss", f"{start:.3f}",
-            "-t", f"{duration:.3f}",
-            "-i", str(video_path),
-            "-vn", "-ac", "1", "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            str(out_path),
-        ],
-        check=True,
+    eligible = sorted(
+        ((i["start_s"], i["end_s"] - i["start_s"]) for i in intervals
+         if (i["end_s"] - i["start_s"]) >= min_seconds),
+        key=lambda x: x[1],
+        reverse=True,
     )
+    picks: list[tuple[float, float]] = []
+    for start, duration in eligible[:top_n]:
+        picks.append((start + 0.2, min(duration - 0.2, max_seconds)))
+    return picks
+
+
+def extract_concat_wav(
+    video_path: Path,
+    clips: list[tuple[float, float]],
+    out_path: Path,
+) -> None:
+    """ffmpeg-extract each (start, duration) clip and concat them into one WAV.
+
+    Each clip is rendered to mono 16 kHz PCM WAV, then concatenated via
+    ffmpeg's concat demuxer (audio-only, no transcoding loss across clips).
+    """
+    if len(clips) == 1:
+        start, duration = clips[0]
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", f"{start:.3f}",
+                "-t", f"{duration:.3f}",
+                "-i", str(video_path),
+                "-vn", "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le",
+                str(out_path),
+            ],
+            check=True,
+        )
+        return
+
+    tmp_dir = out_path.parent / f".{out_path.stem}_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+    try:
+        for i, (start, duration) in enumerate(clips):
+            p = tmp_dir / f"part_{i:02d}.wav"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-ss", f"{start:.3f}",
+                    "-t", f"{duration:.3f}",
+                    "-i", str(video_path),
+                    "-vn", "-ac", "1", "-ar", "16000",
+                    "-c:a", "pcm_s16le",
+                    str(p),
+                ],
+                check=True,
+            )
+            parts.append(p)
+        listfile = tmp_dir / "concat.txt"
+        listfile.write_text("".join(f"file '{p}'\n" for p in parts))
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(listfile),
+                "-c", "copy",
+                str(out_path),
+            ],
+            check=True,
+        )
+    finally:
+        for p in parts:
+            p.unlink(missing_ok=True)
+        (tmp_dir / "concat.txt").unlink(missing_ok=True)
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("video_id", help="YouTube video id (key in video_registry.yml)")
     ap.add_argument("--lang", help="Override target language (defaults to registry value)")
-    ap.add_argument("--max-seconds", type=float, default=15.0)
-    ap.add_argument("--min-seconds", type=float, default=5.0)
+    ap.add_argument("--max-seconds", type=float, default=15.0,
+                    help="Max length of any single included turn (Chatterbox sweet spot ~10-15s)")
+    ap.add_argument("--min-seconds", type=float, default=5.0,
+                    help="Skip any turn shorter than this")
+    ap.add_argument("--top-n", type=int, default=1,
+                    help="Concatenate the top-N longest clean turns per speaker. "
+                         "Higher N = longer reference = more stable Chatterbox cloning.")
     args = ap.parse_args()
 
     title, registry_lang = resolve_title(args.video_id)
@@ -129,19 +189,22 @@ def main() -> None:
     for speaker in sorted(by_speaker):
         intervals = by_speaker[speaker]
         total = sum(i["end_s"] - i["start_s"] for i in intervals)
-        choice = pick_reference_interval(intervals, args.max_seconds, args.min_seconds)
-        if choice is None:
+        clips = pick_reference_intervals(
+            intervals, args.max_seconds, args.min_seconds, args.top_n
+        )
+        if not clips:
             print(
-                f"  {speaker}: total={total:.1f}s — no single turn >= {args.min_seconds}s, "
+                f"  {speaker}: total={total:.1f}s — no turn >= {args.min_seconds}s, "
                 f"skipping (will fall back to default.wav)"
             )
             continue
-        start, duration = choice
         out_path = out_dir / f"{speaker}.wav"
-        extract_wav(video_path, start, duration, out_path)
+        extract_concat_wav(video_path, clips, out_path)
+        clip_total = sum(d for _, d in clips)
+        clip_summary = ", ".join(f"{d:.1f}s@{s:.1f}s" for s, d in clips)
         print(
-            f"  {speaker}: total={total:.1f}s -> {duration:.1f}s clip "
-            f"from {start:.1f}s -> {out_path.name}"
+            f"  {speaker}: total={total:.1f}s -> {len(clips)} clip(s) "
+            f"({clip_total:.1f}s) [{clip_summary}] -> {out_path.name}"
         )
 
     print("\nDone. Re-run TTS to dub with the new per-speaker reference voices.")
