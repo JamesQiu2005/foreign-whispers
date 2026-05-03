@@ -80,7 +80,7 @@ class ChatterboxClient:
         resp = requests.post(
             f"{self.base_url}/v1/audio/speech",
             json={"input": text, "response_format": "wav"},
-            timeout=(5, 60),
+            timeout=(5, int(os.getenv("CHATTERBOX_READ_TIMEOUT", "600"))),
         )
         resp.raise_for_status()
         return resp.content
@@ -104,7 +104,7 @@ class ChatterboxClient:
                 f"{self.base_url}/v1/audio/speech/upload",
                 data={"input": text, "response_format": "wav"},
                 files={"voice_file": (wav_path.name, f, "audio/wav")},
-                timeout=(5, 60),
+                timeout=(5, int(os.getenv("CHATTERBOX_READ_TIMEOUT", "600"))),
             )
         resp.raise_for_status()
         return resp.content
@@ -384,19 +384,21 @@ def _write_align_report(
 
 
 def _compute_speech_offset(source_path: str) -> float:
-    """Compute timing offset between YouTube captions and Whisper segments.
+    """Compute timing offset between YouTube captions and the translation file.
 
-    Returns seconds to add to Whisper timestamps so TTS audio aligns with
-    the actual speech start in the original video.
+    The TTS scheduler uses the translation segments' ``start``/``end`` directly,
+    so the offset must be measured against the translation's own timeline —
+    not against the transcription's. When the translation was derived from
+    YouTube captions (the default path), its seg[0].start already matches
+    yt_start and this returns ~0. When the translation came from a
+    Whisper-only transcription whose timeline starts at 0.0, this returns
+    the real onset gap.
     """
     title = pathlib.Path(source_path).stem
-    # source_path: .../translations/{model}/{title}.json → data_dir is 3 levels up
     base_dir = pathlib.Path(source_path).parent.parent.parent
 
     yt_path = base_dir / "youtube_captions" / f"{title}.txt"
-    whisper_path = base_dir / "transcriptions" / "whisper" / f"{title}.json"
-
-    if not yt_path.exists() or not whisper_path.exists():
+    if not yt_path.exists():
         return 0.0
 
     first_line = yt_path.read_text().split("\n", 1)[0].strip()
@@ -404,11 +406,16 @@ def _compute_speech_offset(source_path: str) -> float:
         return 0.0
     yt_start = json.loads(first_line).get("start", 0.0)
 
-    whisper_data = json.loads(whisper_path.read_text())
-    segs = whisper_data.get("segments", [])
-    whisper_start = segs[0]["start"] if segs else 0.0
+    try:
+        trans = json.loads(pathlib.Path(source_path).read_text())
+    except Exception:
+        return 0.0
+    segs = trans.get("segments", [])
+    trans_start = segs[0]["start"] if segs else 0.0
 
-    return yt_start - whisper_start
+    offset = yt_start - trans_start
+    # Tolerance: ignore sub-100ms drift to avoid pointless shifts.
+    return offset if abs(offset) > 0.1 else 0.0
 
 
 def text_file_to_speech(source_path, output_path, tts_engine=None, *,
@@ -504,7 +511,17 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *,
     # Submit all TTS calls to a thread pool so the GPU stays busy while
     # previous results are being downloaded / decoded.
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    _TTS_WORKERS = int(os.getenv("FW_TTS_WORKERS", "3"))
+    # Concurrency only helps when the TTS endpoint can actually serve parallel
+    # requests. The local Coqui CPU engine and a localhost Chatterbox-MPS server
+    # both serialize on a single device, so 3 workers just multiplies API-side
+    # timeouts while the server queues sequentially. Use 3 only for a remote
+    # (non-localhost) Chatterbox HTTP endpoint that may be a real GPU farm.
+    _is_chatterbox = isinstance(engine, ChatterboxClient)
+    _is_local_chatterbox = _is_chatterbox and (
+        "localhost" in engine.base_url or "127.0.0.1" in engine.base_url
+    )
+    _default_workers = "3" if (_is_chatterbox and not _is_local_chatterbox) else "1"
+    _TTS_WORKERS = int(os.getenv("FW_TTS_WORKERS", _default_workers))
 
     raw_wav_map: dict[int, bytes | None] = {}
 

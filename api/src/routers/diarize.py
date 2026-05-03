@@ -11,13 +11,14 @@ Steps:
 import json
 import subprocess
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from api.src.core.config import settings
 from api.src.core.dependencies import resolve_title
 from api.src.schemas.diarize import DiarizeResponse
 from api.src.services.alignment_service import AlignmentService
-from foreign_whispers.diarization import assign_speakers
+from api.src.services.transcription_service import TranscriptionService
+from foreign_whispers.diarization import assign_speakers, resegment_by_speaker_turns
 
 router = APIRouter(prefix="/api")
 
@@ -52,9 +53,65 @@ def _merge_speakers_into_transcript(title: str, diar_segments: list[dict]) -> No
         path.write_text(json.dumps(doc))
 
 
+def _has_word_timestamps(doc: dict) -> bool:
+    segs = doc.get("segments", [])
+    return bool(segs) and isinstance(segs[0].get("words"), list) and bool(segs[0].get("words"))
+
+
+def _ensure_word_level_transcription(request: Request, title: str) -> dict:
+    """Return a Whisper transcription with per-word timestamps for *title*.
+
+    Re-runs Whisper with ``word_timestamps=True`` if the cached transcription
+    lacks word-level timing (e.g. it came from YouTube captions).
+    """
+    from api.src.main import get_whisper_model
+
+    transcript_path = settings.transcriptions_dir / f"{title}.json"
+    if transcript_path.exists():
+        doc = json.loads(transcript_path.read_text())
+        if _has_word_timestamps(doc):
+            return doc
+
+    video_path = settings.videos_dir / f"{title}.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail=f"Source video missing: {video_path.name}")
+
+    svc = TranscriptionService(ui_dir=settings.data_dir, whisper_model=get_whisper_model(request.app))
+    result = svc.transcribe(str(video_path), word_timestamps=True)
+    settings.transcriptions_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path.write_text(json.dumps(result))
+    return result
+
+
+def _resegment_and_invalidate(title: str, whisper_doc: dict, diar_segments: list[dict]) -> dict:
+    """Overwrite the cached transcription with speaker-turn segments and
+    invalidate the cached translation so it re-runs on the new segmentation.
+
+    Returns the new transcription dict.
+    """
+    new_doc = resegment_by_speaker_turns(whisper_doc, diar_segments)
+    transcript_path = settings.transcriptions_dir / f"{title}.json"
+    transcript_path.write_text(json.dumps(new_doc))
+
+    translation_path = settings.translations_dir / f"{title}.json"
+    if translation_path.exists():
+        translation_path.unlink()
+
+    return new_doc
+
+
 @router.post("/diarize/{video_id}", response_model=DiarizeResponse)
-async def diarize_endpoint(video_id: str):
-    """Run speaker diarization on a video's audio track."""
+async def diarize_endpoint(video_id: str, request: Request):
+    """Run speaker diarization, then re-segment the transcript by speaker turn.
+
+    Flow:
+    1. pyannote on the video's audio → speaker turns.
+    2. Whisper with word-level timestamps (re-run if cache lacks them).
+    3. Bucket Whisper words into diarization turns to produce a new
+       per-speaker-turn transcription that overwrites the cached one.
+    4. Invalidate the cached translation so it re-runs against the new
+       segmentation. Caller is expected to invoke /translate next.
+    """
     title = resolve_title(video_id)
     if title is None:
         raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
@@ -65,11 +122,13 @@ async def diarize_endpoint(video_id: str):
 
     if diar_path.exists():
         data = json.loads(diar_path.read_text())
-        _merge_speakers_into_transcript(title, data.get("segments", []))
+        diar_segments = data.get("segments", [])
+        whisper_doc = _ensure_word_level_transcription(request, title)
+        _resegment_and_invalidate(title, whisper_doc, diar_segments)
         return DiarizeResponse(
             video_id=video_id,
             speakers=data.get("speakers", []),
-            segments=data.get("segments", []),
+            segments=diar_segments,
             skipped=True,
         )
 
@@ -89,7 +148,8 @@ async def diarize_endpoint(video_id: str):
     result = {"speakers": speakers, "segments": diar_segments}
     diar_path.write_text(json.dumps(result))
 
-    _merge_speakers_into_transcript(title, diar_segments)
+    whisper_doc = _ensure_word_level_transcription(request, title)
+    _resegment_and_invalidate(title, whisper_doc, diar_segments)
 
     return DiarizeResponse(
         video_id=video_id,

@@ -47,12 +47,17 @@ async def transcribe_endpoint(
     video_id: str,
     request: Request,
     use_youtube_captions: bool = Query(True, description="Use YouTube captions when available, skipping Whisper"),
+    word_timestamps: bool = Query(False, description="Force Whisper with word-level timestamps (skips YT captions; required for speaker-turn resegmentation)"),
 ):
     """Run Whisper transcription on a downloaded video.
 
     When use_youtube_captions is True (default), YouTube captions are used if
     available, skipping Whisper entirely. When False, Whisper always runs.
+    When word_timestamps is True, YT captions are skipped and Whisper runs
+    with word-level timestamps so each segment carries a ``words`` list.
     """
+    if word_timestamps:
+        use_youtube_captions = False
     videos_dir = settings.videos_dir
     transcriptions_dir = settings.transcriptions_dir
     transcriptions_dir.mkdir(parents=True, exist_ok=True)
@@ -63,7 +68,22 @@ async def transcribe_endpoint(
 
     transcript_path = transcriptions_dir / f"{title}.json"
 
-    # Return cached Whisper result if it exists and we're not forcing re-run
+    # Return cached Whisper result if it exists and we're not forcing re-run.
+    # When word_timestamps is requested, only reuse the cache if it has them.
+    def _has_words(doc: dict) -> bool:
+        segs = doc.get("segments", [])
+        return bool(segs) and isinstance(segs[0].get("words"), list)
+
+    if transcript_path.exists() and word_timestamps:
+        cached = json.loads(transcript_path.read_text())
+        if _has_words(cached):
+            return TranscribeResponse(
+                video_id=video_id,
+                language=cached.get("language", "en"),
+                text=cached.get("text", ""),
+                segments=cached.get("segments", []),
+                skipped=True,
+            )
     if transcript_path.exists() and use_youtube_captions:
         data = json.loads(transcript_path.read_text())
         return TranscribeResponse(
@@ -94,7 +114,7 @@ async def transcribe_endpoint(
         whisper_model=get_whisper_model(request.app),
     )
     video_path = videos_dir / f"{title}.mp4"
-    result = svc.transcribe(str(video_path))
+    result = svc.transcribe(str(video_path), word_timestamps=word_timestamps)
 
     # Persist result
     transcript_path.write_text(json.dumps(result))
