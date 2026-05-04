@@ -247,3 +247,94 @@ cd frontend && pnpm install && pnpm dev
 - ffmpeg (system-wide)
 - deno (for yt-dlp YouTube extraction)
 - NVIDIA GPU recommended for Whisper + Chatterbox inference
+- For Apple Silicon adaptation see APPLE_SILICON_ADAPTATION_SUMMARY.md
+
+### Key Implementation Strategies
+
+#### Phased evolution (`notebooks_vanilla` → `notebooks`)
+
+`notebooks_vanilla/` is the unmodified course baseline; `notebooks/` is the
+working set. Diffing the two trees (`diff -rq notebooks_vanilla notebooks`)
+shows what changed — every stage notebook now ships with a `NOTES.md`
+walkthrough, the `.ipynb` cells were rewritten to reflect the per-stage
+fixes, and the cached `.png` plots were regenerated from the new pipeline
+output. Three concrete phases:
+
+**Phase 1 — Single-voice TTS.**
+*Notebook:* `tts_integration`.
+The first end-to-end dub. Translation → Chatterbox → ffmpeg remux all
+worked, but every speaker in the source video came out in *one* canned
+voice — the `voice_map` parameter wasn't being threaded through and the
+client never enrolled per-speaker reference WAVs. The dub was
+intelligible but indistinguishable from the vanilla baseline.
+
+**Phase 2 — Diarization + per-speaker cloning, with three latent bugs.**
+*Notebooks:* `diarization_integration`, `tts_integration` (Task 5).
+Added pyannote `speaker-diarization-3.1` between transcribe and
+translate; `assign_speakers` merges labels into segment JSON; TTS
+endpoint builds a `voice_map` from `pipeline_data/speakers/<lang>/`
+and forwards `speaker_wav` per segment to Chatterbox. Per-speaker
+voices started landing — but three bugs stayed hidden until repeated
+runs:
+
+  - **Memory leak (~85 GB on a 3-min video).** `Pipeline.from_pretrained`
+    was called inside `diarize_audio` on every request; the MPS caching
+    allocator never shrinks, so each call leaked ~1 GB of pyannote
+    state and Whisper word-timestamp attention slabs piled up alongside.
+  - **Audio offset drift (1–2 s late).** `resegment_by_speaker_turns`
+    threw away Whisper's per-word timestamps, which meant `/diarize`
+    re-ran Whisper-with-words on every call *and* corrupted the
+    timing reference used by the alignment stage.
+  - **"Sound dies after the opening".** `ChatterboxClient` used a 60 s
+    HTTP read timeout, but a 200-char Spanish segment takes 60–120 s
+    on MPS; with 3 concurrent workers queueing on a single GPU,
+    29 of 31 segments timed out from the API's view (the server kept
+    rendering audio nobody was listening for) and were padded with
+    silence.
+
+**Phase 3 — Bounded RAM, correct timing, clean audio.**
+Singleton pyannote pipeline + `torch.mps.empty_cache()` + `gc.collect()`
+after each Whisper call (RSS plateaus at ~4 GB across repeated runs vs
+the 85 GB leak); `resegment_by_speaker_turns` preserves `words` so the
+re-segmentation is one-shot; `CHATTERBOX_READ_TIMEOUT=600` and
+auto-clamping `FW_TTS_WORKERS=1` for a localhost Chatterbox stop the
+silence dropouts. Verification via `scripts/verify_dubbed_video.py`
+(silero-VAD onset delta + ECAPA-TDNN top-1 speaker accuracy) reports
+**0.0 s onset delta**, **31/31 segments populated**, and **31/31
+speaker labels matching their reference embedding** on the dubbed audio.
+Remaining limitations: cross-lingual voice cloning (English reference →
+Spanish output) keeps the cloned voice timbre slightly off the original
+speaker — recognisable but not photoreal — and short turns (<2 s) still
+occasionally land on the wrong centroid. Both are model-level issues
+rather than pipeline bugs.
+
+**Phase 4 — Multi-video runs and Chatterbox watchdog.**
+Going from one video to the full `video_registry.yml` surfaced two
+operational issues invisible in single-video testing:
+
+  - **Speaker references are per-language, not per-video.**
+    `pipeline_data/speakers/<lang>/SPEAKER_NN.wav` is a single global
+    namespace, and `scripts/extract_speaker_voices.py` overwrites it on
+    every run. A second video would silently reuse the previous video's
+    voices for cloning. Fix: back up the freshly-extracted refs to
+    `pipeline_data/speakers/<lang>/<video_id>/` after each extraction so
+    nothing is lost when the next video clobbers the global slots.
+    Restoring is one `cp`.
+  - **Chatterbox-MPS can die mid-run on long videos.** The Alysa Liu
+    interview (4 speakers, 157 segments) hit a server crash partway
+    through; the API kept POSTing and got `Connection refused` for every
+    subsequent segment, padding 57/157 segments with silence. The
+    in-process `requests`-side timeout fix from Phase 3 doesn't help if
+    the *server* is gone. Fix: a tiny shell watchdog that polls
+    `/health` every 30 s and re-invokes `./scripts/dev.sh start
+    chatterbox` when down. With the watchdog in place the next video
+    (Rob Reiner — 8 speakers, 144 segments, 39-min TTS) ran clean
+    end-to-end with **0/144 silent segments**.
+
+Final scorecard across the three processed videos:
+
+| Video                | Speakers | Segs | Onset Δ | Speaker acc (dub) | Silent |
+| -------------------- | -------: | ---: | ------: | ----------------: | -----: |
+| Strait of Hormuz     |        3 |   31 |  0.00 s |              100% |   0/31 |
+| Alysa Liu (pre-fix)  |        4 |  157 | +0.10 s |             68.4% | 57/157 |
+| Rob Reiner (w/watch) |        8 |  144 | -0.10 s |             90.5% |  0/144 |
